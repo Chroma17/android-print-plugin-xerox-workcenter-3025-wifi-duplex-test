@@ -52,7 +52,7 @@ Release APKs are signed with a dedicated keystore stored in GitHub Actions secre
 
 - Better UI (Material Design, proper settings layout)
 - Automatic printer discovery (mDNS/Bonjour)
-- Duplex printing support
+- Duplex printing support (manual duplex is implemented; hardware duplex is not available on the 3025)
 - Scanning support (the 3025 has a scanner)
 - Support for other Xerox/Samsung SPL printers
 - Localization

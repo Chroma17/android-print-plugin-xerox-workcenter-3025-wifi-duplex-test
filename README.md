@@ -134,7 +134,7 @@ This is a working MVP. Possible future additions:
 - [x] Scanning support
 - [ ] Better UI (Material Design)
 - [ ] Automatic printer discovery (no more typing IP addresses)
-- [ ] Duplex printing
+- [x] Manual duplex printing (prints fronts, asks you to flip the stack, prints backs)
 - [ ] Multi-page scan (ADF support if available)
 - [ ] PDF export for scans
 - [ ] Support for similar Xerox/Samsung SPL printers

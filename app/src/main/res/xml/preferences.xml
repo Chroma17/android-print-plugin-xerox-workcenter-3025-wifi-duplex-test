@@ -20,6 +20,22 @@
 
     </PreferenceCategory>
 
+    <PreferenceCategory app:title="@string/pref_category_duplex">
+
+        <SwitchPreferenceCompat
+            app:key="duplex_reverse_even"
+            app:title="@string/pref_duplex_reverse"
+            app:summary="@string/pref_duplex_reverse_summary"
+            app:defaultValue="true" />
+
+        <SwitchPreferenceCompat
+            app:key="duplex_rotate_even"
+            app:title="@string/pref_duplex_rotate"
+            app:summary="@string/pref_duplex_rotate_summary"
+            app:defaultValue="false" />
+
+    </PreferenceCategory>
+
     <PreferenceCategory app:title="@string/pref_category_diagnostics">
 
         <Preference

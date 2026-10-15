@@ -21,64 +21,102 @@ public class UrfEncoder {
      */
     public static byte[] encode(Bitmap[] pages) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-        // File header: "UNIRAST\0" + page count
-        out.write(new byte[]{'U', 'N', 'I', 'R', 'A', 'S', 'T', 0x00});
-        writeInt(out, pages.length);
-
+        writeDocumentHeader(out, pages.length);
         for (int p = 0; p < pages.length; p++) {
-            Bitmap bmp = pages[p];
-            int width = bmp.getWidth();
-            int height = bmp.getHeight();
+            PrintLog.i(TAG, "Encoding page " + (p + 1) + "/" + pages.length);
+            encodePage(out, pages[p], false);
+        }
+        return out.toByteArray();
+    }
 
-            PrintLog.i(TAG, "Encoding page " + (p + 1) + "/" + pages.length
-                    + " (" + width + "x" + height + ")");
+    /** File header: "UNIRAST\0" + page count. Call once, before any encodePage(). */
+    public static void writeDocumentHeader(ByteArrayOutputStream out, int pageCount)
+            throws IOException {
+        out.write(new byte[]{'U', 'N', 'I', 'R', 'A', 'S', 'T', 0x00});
+        writeInt(out, pageCount);
+    }
 
-            // Page header (32 bytes)
-            byte[] pageHdr = new byte[32];
-            pageHdr[0] = 8;    // bitsPerPixel
-            pageHdr[1] = 0;    // colorSpace: W8 (grayscale)
-            pageHdr[2] = 1;    // duplex: 1 (one-sided, required by printer)
-            pageHdr[3] = 0;    // quality: default
-            // bytes 4-11: reserved (zeros)
-            putInt(pageHdr, 12, width);
-            putInt(pageHdr, 16, height);
-            putInt(pageHdr, 20, DPI_600);
-            // bytes 24-31: reserved (zeros)
-            out.write(pageHdr);
+    private static void writePageHeader(ByteArrayOutputStream out, int width, int height)
+            throws IOException {
+        byte[] pageHdr = new byte[32];
+        pageHdr[0] = 8;    // bitsPerPixel
+        pageHdr[1] = 0;    // colorSpace: W8 (grayscale)
+        pageHdr[2] = 1;    // duplex: 1 (one-sided, required by printer)
+        pageHdr[3] = 0;    // quality: default
+        // bytes 4-11: reserved (zeros)
+        putInt(pageHdr, 12, width);
+        putInt(pageHdr, 16, height);
+        putInt(pageHdr, 20, DPI_600);
+        // bytes 24-31: reserved (zeros)
+        out.write(pageHdr);
+    }
 
-            // Convert bitmap to grayscale byte rows and encode with PWG compression
-            byte[] prevRow = null;
-            int y = 0;
+    /**
+     * Encode a single page and append it to the stream. Lets callers render, encode and
+     * recycle one page at a time instead of holding every 600 DPI bitmap in memory.
+     *
+     * @param rotate180 rotate the page 180 degrees while encoding (no extra bitmap needed)
+     */
+    public static void encodePage(ByteArrayOutputStream out, Bitmap bmp, boolean rotate180)
+            throws IOException {
+        int width = bmp.getWidth();
+        int height = bmp.getHeight();
+        writePageHeader(out, width, height);
 
-            while (y < height) {
-                byte[] row = bitmapRowToGray(bmp, y, width);
-
-                // Count identical following lines for repeat
-                int repeat = 0;
-                while (y + repeat + 1 < height && repeat < 255) {
-                    byte[] nextRow = bitmapRowToGray(bmp, y + repeat + 1, width);
-                    if (java.util.Arrays.equals(row, nextRow)) {
-                        repeat++;
-                    } else {
-                        break;
-                    }
+        int y = 0;
+        byte[] row = outputRow(bmp, 0, width, height, rotate180);
+        while (y < height) {
+            // Count identical following lines for repeat
+            int repeat = 0;
+            byte[] next = null;
+            while (y + repeat + 1 < height && repeat < 255) {
+                byte[] candidate = outputRow(bmp, y + repeat + 1, width, height, rotate180);
+                if (java.util.Arrays.equals(row, candidate)) {
+                    repeat++;
+                } else {
+                    next = candidate;
+                    break;
                 }
-
-                // Line repeat count
-                out.write(repeat);
-
-                // PWG-compressed line data
-                pwgEncodeLine(out, row);
-
-                y += repeat + 1;
             }
 
-            long pageSize = out.size();
-            PrintLog.i(TAG, "Page " + (p + 1) + " encoded, total so far: " + pageSize + " bytes");
-        }
+            // Line repeat count
+            out.write(repeat);
+            // PWG-compressed line data
+            pwgEncodeLine(out, row);
 
-        return out.toByteArray();
+            y += repeat + 1;
+            if (y < height) {
+                row = (next != null) ? next : outputRow(bmp, y, width, height, rotate180);
+            }
+        }
+    }
+
+    /** Append an all-white A4 page without allocating a bitmap for it. */
+    public static void encodeBlankPage(ByteArrayOutputStream out) throws IOException {
+        writePageHeader(out, A4_WIDTH_600, A4_HEIGHT_600);
+        byte[] white = new byte[A4_WIDTH_600];
+        java.util.Arrays.fill(white, (byte) 0xFF);
+        int remaining = A4_HEIGHT_600;
+        while (remaining > 0) {
+            int n = Math.min(256, remaining);
+            out.write(n - 1);          // line repeat count
+            pwgEncodeLine(out, white);
+            remaining -= n;
+        }
+    }
+
+    /** Row y of the output page; when rotated 180 it is source row (h-1-y), reversed. */
+    private static byte[] outputRow(Bitmap bmp, int y, int width, int height, boolean rotate180) {
+        if (!rotate180) {
+            return bitmapRowToGray(bmp, y, width);
+        }
+        byte[] src = bitmapRowToGray(bmp, height - 1 - y, width);
+        for (int i = 0, j = width - 1; i < j; i++, j--) {
+            byte t = src[i];
+            src[i] = src[j];
+            src[j] = t;
+        }
+        return src;
     }
 
     /**
