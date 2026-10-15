@@ -1,0 +1,870 @@
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/README.md android-print-plugin-xerox-workcenter-3025-wifi-main/README.md
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/README.md	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/README.md	2026-10-15 10:57:12.129356021 +0000
+@@ -134,7 +134,7 @@
+ - [x] Scanning support
+ - [ ] Better UI (Material Design)
+ - [ ] Automatic printer discovery (no more typing IP addresses)
+-- [ ] Duplex printing
++- [x] Manual duplex printing (prints fronts, asks you to flip the stack, prints backs)
+ - [ ] Multi-page scan (ADF support if available)
+ - [ ] PDF export for scans
+ - [ ] Support for similar Xerox/Samsung SPL printers
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/AndroidManifest.xml android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/AndroidManifest.xml
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/AndroidManifest.xml	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/AndroidManifest.xml	2026-10-15 10:57:12.128378101 +0000
+@@ -49,6 +49,11 @@
+                 android:resource="@xml/file_paths" />
+         </provider>
+ 
++        <!-- Handles the "Print back sides" / "Cancel" buttons of the manual duplex notification -->
++        <receiver
++            android:name=".DuplexActionReceiver"
++            android:exported="false" />
++
+         <!-- The PrintService itself -->
+         <service
+             android:name=".Xerox3025PrintService"
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/DuplexActionReceiver.java android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/DuplexActionReceiver.java
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/DuplexActionReceiver.java	1970-01-01 00:00:00.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/DuplexActionReceiver.java	2026-10-15 10:56:52.423203354 +0000
+@@ -0,0 +1,55 @@
++package com.xerox3025.printplugin;
++
++import android.app.NotificationManager;
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++
++import java.util.Map;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Receives the "Print back sides" / "Cancel" buttons of the manual-duplex notification
++ * and hands the answer to the print thread that is waiting for it.
++ */
++public class DuplexActionReceiver extends BroadcastReceiver {
++
++    public static final String ACTION_CONTINUE = "com.xerox3025.printplugin.DUPLEX_CONTINUE";
++    public static final String ACTION_CANCEL = "com.xerox3025.printplugin.DUPLEX_CANCEL";
++    public static final String EXTRA_JOB_KEY = "job_key";
++
++    private static final Map<Integer, BlockingQueue<Boolean>> WAITING = new ConcurrentHashMap<>();
++
++    /** Called by the print thread before it posts the prompt notification. */
++    static BlockingQueue<Boolean> register(int jobKey) {
++        BlockingQueue<Boolean> q = new ArrayBlockingQueue<>(1);
++        WAITING.put(jobKey, q);
++        return q;
++    }
++
++    static void unregister(int jobKey) {
++        WAITING.remove(jobKey);
++    }
++
++    /** true = continue with the back sides, false = give up. */
++    static void signal(int jobKey, boolean proceed) {
++        BlockingQueue<Boolean> q = WAITING.get(jobKey);
++        if (q != null) q.offer(proceed);
++    }
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        int key = intent.getIntExtra(EXTRA_JOB_KEY, 0);
++        boolean proceed = ACTION_CONTINUE.equals(intent.getAction());
++        if (!WAITING.containsKey(key)) {
++            // The print service was restarted since page 1 was printed; nothing to resume.
++            PrintLog.w("DuplexReceiver", "No waiting job for key " + key);
++            context.getSystemService(NotificationManager.class).cancel(key);
++            return;
++        }
++        PrintLog.i("DuplexReceiver", proceed ? "User tapped Print back sides" : "User cancelled duplex");
++        signal(key, proceed);
++    }
++}
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/IppClient.java android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/IppClient.java
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/IppClient.java	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/IppClient.java	2026-10-15 10:56:11.372321658 +0000
+@@ -48,33 +48,81 @@
+             out.write(ippRequest);
+             out.flush();
+ 
++            // Read the full HTTP response. A single read() often returns only the HTTP
++            // headers (the printer sends headers and body in separate segments), which
++            // used to be reported as "IPP status 0xffffffff" even though the job printed.
+             InputStream in = socket.getInputStream();
+-            byte[] resp = new byte[4096];
+-            int read = in.read(resp);
++            ByteArrayOutputStream respBuf = new ByteArrayOutputStream();
++            byte[] chunk = new byte[4096];
++            int headerEnd = -1;
++            int contentLength = -1;
++            boolean chunked = false;
++            try {
++                while (true) {
++                    int n = in.read(chunk);
++                    if (n < 0) break;
++                    respBuf.write(chunk, 0, n);
++                    byte[] cur = respBuf.toByteArray();
++                    if (headerEnd < 0) {
++                        headerEnd = indexOf(cur, cur.length, "\r\n\r\n");
++                        if (headerEnd >= 0) {
++                            String headers = new String(cur, 0, headerEnd).toLowerCase();
++                            chunked = headers.contains("transfer-encoding: chunked");
++                            int cl = headers.indexOf("content-length:");
++                            if (cl >= 0) {
++                                int eol = headers.indexOf("\r\n", cl);
++                                String v = headers.substring(cl + 15, eol < 0 ? headers.length() : eol).trim();
++                                try { contentLength = Integer.parseInt(v); } catch (NumberFormatException ignored) {}
++                            }
++                        }
++                    }
++                    if (headerEnd >= 0) {
++                        int bodyLen = cur.length - (headerEnd + 4);
++                        if (contentLength >= 0 ? bodyLen >= contentLength : bodyLen >= 12) break;
++                    }
++                }
++            } catch (java.net.SocketTimeoutException e) {
++                PrintLog.w(TAG, "Timed out waiting for printer response");
++            }
+             socket.close();
+ 
++            byte[] resp = respBuf.toByteArray();
++            int read = resp.length;
+             if (read <= 0) {
+                 PrintLog.e(TAG, "Empty response from printer");
+                 return new IppResult(false, -1, "Empty response from printer");
+             }
+ 
+-            String response = new String(resp, 0, Math.min(read, 200));
+-            boolean httpOk = response.contains("200");
++            String statusLine = new String(resp, 0, Math.min(read, 64)).split("\r\n", 2)[0];
++            String[] parts = statusLine.split(" ");
++            boolean httpOk = parts.length >= 2 && parts[1].equals("200");
+ 
+-            // Parse IPP status from response body
++            // Parse IPP status from response body: version(2) status(2) request-id(4)
+             int ippStatus = -1;
+             int bodyStart = indexOf(resp, read, "\r\n\r\n");
+-            if (bodyStart >= 0 && bodyStart + 6 < read) {
+-                bodyStart += 4; // skip \r\n\r\n
+-                ippStatus = ((resp[bodyStart + 2] & 0xFF) << 8) | (resp[bodyStart + 3] & 0xFF);
++            if (bodyStart >= 0) {
++                bodyStart += 4;
++                if (chunked) {
++                    int eol = indexOf(java.util.Arrays.copyOfRange(resp, bodyStart, read),
++                            read - bodyStart, "\r\n");
++                    bodyStart = (eol >= 0) ? bodyStart + eol + 2 : read;
++                }
++                if (bodyStart + 4 <= read) {
++                    ippStatus = ((resp[bodyStart + 2] & 0xFF) << 8) | (resp[bodyStart + 3] & 0xFF);
++                }
+             }
+ 
+             if (httpOk && ippStatus >= 0 && ippStatus < 0x0100) {
+                 PrintLog.i(TAG, "IPP job accepted (status 0x"
+                         + String.format("%04x", ippStatus) + ")");
+                 return new IppResult(true, ippStatus, "Job accepted");
++            } else if (httpOk && ippStatus < 0) {
++                // The printer took the data (HTTP 200) but sent no readable IPP status.
++                // In practice the job still prints, so don't report a failure.
++                PrintLog.w(TAG, "HTTP 200 but no IPP status in response; assuming job accepted");
++                return new IppResult(true, -1, "Job sent (no status from printer)");
+             } else {
+-                String msg = "IPP error: HTTP " + (httpOk ? "200" : "error")
++                String msg = "IPP error: HTTP " + (httpOk ? "200" : statusLine)
+                         + ", IPP status 0x" + String.format("%04x", ippStatus);
+                 PrintLog.e(TAG, msg);
+                 return new IppResult(false, ippStatus, msg);
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/UrfEncoder.java android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/UrfEncoder.java
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/UrfEncoder.java	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/UrfEncoder.java	2026-10-15 10:56:00.777892490 +0000
+@@ -21,84 +21,102 @@
+      */
+     public static byte[] encode(Bitmap[] pages) throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+-
+-        // File header: "UNIRAST\0" + page count
+-        out.write(new byte[]{'U', 'N', 'I', 'R', 'A', 'S', 'T', 0x00});
+-        writeInt(out, pages.length);
+-
++        writeDocumentHeader(out, pages.length);
+         for (int p = 0; p < pages.length; p++) {
+-            Bitmap bmp = pages[p];
+-            int width = bmp.getWidth();
+-            int height = bmp.getHeight();
+-
+-            PrintLog.i(TAG, "Encoding page " + (p + 1) + "/" + pages.length
+-                    + " (" + width + "x" + height + ")");
+-
+-            // Page header (32 bytes)
+-            byte[] pageHdr = new byte[32];
+-            pageHdr[0] = 8;    // bitsPerPixel
+-            pageHdr[1] = 0;    // colorSpace: W8 (grayscale)
+-            pageHdr[2] = 1;    // duplex: 1 (one-sided, required by printer)
+-            pageHdr[3] = 0;    // quality: default
+-            // bytes 4-11: reserved (zeros)
+-            putInt(pageHdr, 12, width);
+-            putInt(pageHdr, 16, height);
+-            putInt(pageHdr, 20, DPI_600);
+-            // bytes 24-31: reserved (zeros)
+-            out.write(pageHdr);
+-
+-            // Convert bitmap to grayscale byte rows and encode with PWG compression
+-            byte[] prevRow = null;
+-            int y = 0;
+-
+-            while (y < height) {
+-                byte[] row = bitmapRowToGray(bmp, y, width);
+-
+-                // Count identical following lines for repeat
+-                int repeat = 0;
+-                while (y + repeat + 1 < height && repeat < 255) {
+-                    byte[] nextRow = bitmapRowToGray(bmp, y + repeat + 1, width);
+-                    if (java.util.Arrays.equals(row, nextRow)) {
+-                        repeat++;
+-                    } else {
+-                        break;
+-                    }
+-                }
++            PrintLog.i(TAG, "Encoding page " + (p + 1) + "/" + pages.length);
++            encodePage(out, pages[p], false);
++        }
++        return out.toByteArray();
++    }
+ 
+-                // Line repeat count
+-                out.write(repeat);
++    /** File header: "UNIRAST\0" + page count. Call once, before any encodePage(). */
++    public static void writeDocumentHeader(ByteArrayOutputStream out, int pageCount)
++            throws IOException {
++        out.write(new byte[]{'U', 'N', 'I', 'R', 'A', 'S', 'T', 0x00});
++        writeInt(out, pageCount);
++    }
+ 
+-                // PWG-compressed line data
+-                pwgEncodeLine(out, row);
++    private static void writePageHeader(ByteArrayOutputStream out, int width, int height)
++            throws IOException {
++        byte[] pageHdr = new byte[32];
++        pageHdr[0] = 8;    // bitsPerPixel
++        pageHdr[1] = 0;    // colorSpace: W8 (grayscale)
++        pageHdr[2] = 1;    // duplex: 1 (one-sided, required by printer)
++        pageHdr[3] = 0;    // quality: default
++        // bytes 4-11: reserved (zeros)
++        putInt(pageHdr, 12, width);
++        putInt(pageHdr, 16, height);
++        putInt(pageHdr, 20, DPI_600);
++        // bytes 24-31: reserved (zeros)
++        out.write(pageHdr);
++    }
+ 
+-                y += repeat + 1;
++    /**
++     * Encode a single page and append it to the stream. Lets callers render, encode and
++     * recycle one page at a time instead of holding every 600 DPI bitmap in memory.
++     *
++     * @param rotate180 rotate the page 180 degrees while encoding (no extra bitmap needed)
++     */
++    public static void encodePage(ByteArrayOutputStream out, Bitmap bmp, boolean rotate180)
++            throws IOException {
++        int width = bmp.getWidth();
++        int height = bmp.getHeight();
++        writePageHeader(out, width, height);
++
++        int y = 0;
++        byte[] row = outputRow(bmp, 0, width, height, rotate180);
++        while (y < height) {
++            // Count identical following lines for repeat
++            int repeat = 0;
++            byte[] next = null;
++            while (y + repeat + 1 < height && repeat < 255) {
++                byte[] candidate = outputRow(bmp, y + repeat + 1, width, height, rotate180);
++                if (java.util.Arrays.equals(row, candidate)) {
++                    repeat++;
++                } else {
++                    next = candidate;
++                    break;
++                }
+             }
+ 
+-            long pageSize = out.size();
+-            PrintLog.i(TAG, "Page " + (p + 1) + " encoded, total so far: " + pageSize + " bytes");
++            // Line repeat count
++            out.write(repeat);
++            // PWG-compressed line data
++            pwgEncodeLine(out, row);
++
++            y += repeat + 1;
++            if (y < height) {
++                row = (next != null) ? next : outputRow(bmp, y, width, height, rotate180);
++            }
+         }
++    }
+ 
+-        return out.toByteArray();
++    /** Append an all-white A4 page without allocating a bitmap for it. */
++    public static void encodeBlankPage(ByteArrayOutputStream out) throws IOException {
++        writePageHeader(out, A4_WIDTH_600, A4_HEIGHT_600);
++        byte[] white = new byte[A4_WIDTH_600];
++        java.util.Arrays.fill(white, (byte) 0xFF);
++        int remaining = A4_HEIGHT_600;
++        while (remaining > 0) {
++            int n = Math.min(256, remaining);
++            out.write(n - 1);          // line repeat count
++            pwgEncodeLine(out, white);
++            remaining -= n;
++        }
+     }
+ 
+-    /**
+-     * Extract one row of grayscale pixels from a bitmap.
+-     * Input bitmap is ARGB_8888; output is 8-bit grayscale (0=black, 255=white).
+-     */
+-    private static byte[] bitmapRowToGray(Bitmap bmp, int y, int width) {
+-        int[] pixels = new int[width];
+-        bmp.getPixels(pixels, 0, width, 0, y, width, 1);
+-
+-        byte[] gray = new byte[width];
+-        for (int x = 0; x < width; x++) {
+-            int pixel = pixels[x];
+-            int r = Color.red(pixel);
+-            int g = Color.green(pixel);
+-            int b = Color.blue(pixel);
+-            // Standard luminance formula
+-            gray[x] = (byte) ((r * 77 + g * 150 + b * 29) >> 8);
++    /** Row y of the output page; when rotated 180 it is source row (h-1-y), reversed. */
++    private static byte[] outputRow(Bitmap bmp, int y, int width, int height, boolean rotate180) {
++        if (!rotate180) {
++            return bitmapRowToGray(bmp, y, width);
++        }
++        byte[] src = bitmapRowToGray(bmp, height - 1 - y, width);
++        for (int i = 0, j = width - 1; i < j; i++, j--) {
++            byte t = src[i];
++            src[i] = src[j];
++            src[j] = t;
+         }
+-        return gray;
++        return src;
+     }
+ 
+     /**
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/Xerox3025PrintService.java android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/Xerox3025PrintService.java
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/Xerox3025PrintService.java	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/java/com/xerox3025/printplugin/Xerox3025PrintService.java	2026-10-15 10:56:52.439456921 +0000
+@@ -2,6 +2,8 @@
+ 
+ import android.app.NotificationChannel;
+ import android.app.NotificationManager;
++import android.app.PendingIntent;
++import android.content.Intent;
+ import android.content.SharedPreferences;
+ import android.graphics.Bitmap;
+ import android.graphics.pdf.PdfRenderer;
+@@ -21,6 +23,7 @@
+ import android.os.Handler;
+ import android.os.Looper;
+ 
++import java.io.ByteArrayOutputStream;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+@@ -28,11 +31,15 @@
+ import java.io.InputStream;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.TimeUnit;
+ 
+ public class Xerox3025PrintService extends PrintService {
+ 
+     private static final String TAG = "Xerox3025Print";
+     private static final String CHANNEL_ID = "print_jobs";
++    private static final String DUPLEX_CHANNEL_ID = "duplex_prompts";
++    private static final long DUPLEX_WAIT_MS = 30 * 60 * 1000L;
+     private volatile boolean cancelled = false;
+     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+ 
+@@ -44,6 +51,11 @@
+                 CHANNEL_ID, "Print Jobs", NotificationManager.IMPORTANCE_LOW);
+         channel.setDescription("Print job status notifications");
+         getSystemService(NotificationManager.class).createNotificationChannel(channel);
++
++        NotificationChannel duplexChannel = new NotificationChannel(
++                DUPLEX_CHANNEL_ID, "Two-sided printing prompts", NotificationManager.IMPORTANCE_HIGH);
++        duplexChannel.setDescription("Asks you to flip the pages for manual two-sided printing");
++        getSystemService(NotificationManager.class).createNotificationChannel(duplexChannel);
+     }
+ 
+     @Override
+@@ -71,6 +83,7 @@
+     @Override
+     protected void onRequestCancelPrintJob(PrintJob printJob) {
+         cancelled = true;
++        DuplexActionReceiver.signal(printJob.getId().hashCode(), false);
+         printJob.cancel();
+     }
+ 
+@@ -79,6 +92,8 @@
+         // All PrintJob methods must be called on the main thread
+         String jobName = printJob.getInfo().getLabel();
+         int notifId = printJob.getId().hashCode();
++        PrintAttributes attrs = printJob.getInfo().getAttributes();
++        int duplexMode = (attrs != null) ? attrs.getDuplexMode() : PrintAttributes.DUPLEX_MODE_NONE;
+         PrintLog.i(TAG, "onPrintJobQueued called: " + jobName);
+         cancelled = false;
+         printJob.start();
+@@ -100,7 +115,7 @@
+ 
+         new Thread(() -> {
+             try {
+-                processPrintJob(printJob, jobName, notifId, pfd, printerIp);
++                processPrintJob(printJob, jobName, notifId, pfd, printerIp, duplexMode);
+             } catch (Exception e) {
+                 PrintLog.e(TAG, "Uncaught exception in processPrintJob", e);
+                 mainHandler.post(() -> {
+@@ -116,8 +131,25 @@
+     }
+ 
+     private void processPrintJob(PrintJob printJob, String jobName, int notifId,
+-                                  ParcelFileDescriptor pfd, String printerIp) {
+-        PrintLog.i(TAG, "Starting print job: " + jobName);
++                                  ParcelFileDescriptor pfd, String printerIp,
++                                  int duplexMode) {
++        PrintLog.i(TAG, "Starting print job: " + jobName + " (duplexMode=" + duplexMode + ")");
++
++        boolean wantsDuplex = duplexMode == PrintAttributes.DUPLEX_MODE_LONG_EDGE
++                || duplexMode == PrintAttributes.DUPLEX_MODE_SHORT_EDGE;
++        boolean shortEdge = duplexMode == PrintAttributes.DUPLEX_MODE_SHORT_EDGE;
++
++        // The "flip the stack" prompt is a notification; without permission the user
++        // would never see it and pass 1 would be wasted paper.
++        if (wantsDuplex && !getSystemService(NotificationManager.class).areNotificationsEnabled()) {
++            String reason = "Two-sided printing needs notifications: allow them for this app "
++                    + "in Android settings, or choose one-sided";
++            mainHandler.post(() -> printJob.fail(reason));
++            PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
++                    jobName, System.currentTimeMillis(), "FAILED", reason, 0));
++            closeQuietly(pfd);
++            return;
++        }
+ 
+         // Show ongoing notification
+         NotificationCompat.Builder notifBuilder = new NotificationCompat.Builder(this, CHANNEL_ID)
+@@ -137,123 +169,253 @@
+             // Copy PFD to temp file (PdfRenderer needs seekable FD)
+             tempFile = File.createTempFile("print_", ".pdf", getCacheDir());
+             copyToFile(pfd, tempFile);
+-            long pdfSize = tempFile.length();
+-            PrintLog.i(TAG, "PDF copied to temp file: " + pdfSize + " bytes");
++            PrintLog.i(TAG, "PDF copied to temp file: " + tempFile.length() + " bytes");
+ 
+-            // Open PDF and render pages to URF
+-            ParcelFileDescriptor tempPfd = ParcelFileDescriptor.open(tempFile,
+-                    ParcelFileDescriptor.MODE_READ_ONLY);
+-            PdfRenderer renderer = new PdfRenderer(tempPfd);
+-            int pageCount = renderer.getPageCount();
++            int pageCount;
++            {
++                ParcelFileDescriptor tmp = ParcelFileDescriptor.open(tempFile,
++                        ParcelFileDescriptor.MODE_READ_ONLY);
++                PdfRenderer r = new PdfRenderer(tmp);
++                pageCount = r.getPageCount();
++                r.close();
++                tmp.close();
++            }
+             PrintLog.i(TAG, "PDF has " + pageCount + " page(s)");
+ 
+-            Bitmap[] pages = new Bitmap[pageCount];
+-            for (int i = 0; i < pageCount; i++) {
+-                if (cancelled) {
+-                    PrintLog.i(TAG, "Job cancelled by user");
+-                    renderer.close();
+-                    tempPfd.close();
+-                    mainHandler.post(printJob::cancel);
+-                    getSystemService(NotificationManager.class).cancel(notifId);
+-                    PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+-                            jobName, System.currentTimeMillis(), "CANCELLED",
+-                            "Cancelled by user", pageCount));
+-                    return;
+-                }
+-
+-                long renderStart = System.currentTimeMillis();
+-                PdfRenderer.Page page = renderer.openPage(i);
+-
+-                // Render at 600 DPI, matching printer's expected dimensions
+-                Bitmap bmp = Bitmap.createBitmap(
+-                        UrfEncoder.A4_WIDTH_600, UrfEncoder.A4_HEIGHT_600,
+-                        Bitmap.Config.ARGB_8888);
+-                // Fill white first (PDF may not fill background)
+-                bmp.eraseColor(0xFFFFFFFF);
+-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT);
+-                page.close();
++            boolean manualDuplex = wantsDuplex && pageCount > 1;
+ 
+-                pages[i] = bmp;
+-                long renderTime = System.currentTimeMillis() - renderStart;
+-                PrintLog.i(TAG, "Page " + (i + 1) + " rendered in " + renderTime + " ms");
++            if (!manualDuplex) {
++                // ---- Normal one-sided job: all pages in one go ----
++                List<Integer> all = new ArrayList<>();
++                for (int i = 0; i < pageCount; i++) all.add(i);
++                IppClient.IppResult result = renderAndSend(tempFile, all, false, printerIp, jobName);
++                finishJob(printJob, jobName, notifId, notifBuilder, result, pageCount, "");
++                return;
+             }
+-            renderer.close();
+-            tempPfd.close();
+ 
+-            // Encode as URF
+-            long encodeStart = System.currentTimeMillis();
+-            byte[] urfData = UrfEncoder.encode(pages);
+-            long encodeTime = System.currentTimeMillis() - encodeStart;
+-            PrintLog.i(TAG, "URF encoded: " + urfData.length + " bytes in " + encodeTime + " ms");
+-
+-            // Recycle bitmaps
+-            for (Bitmap bmp : pages) {
+-                if (bmp != null && !bmp.isRecycled()) bmp.recycle();
++            // ---- Manual duplex ----
++            SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
++            boolean reverseEven = prefs.getBoolean("duplex_reverse_even", true);
++            boolean rotatePref = prefs.getBoolean("duplex_rotate_even", false);
++            // Short-edge binding means the back sides are turned 180 degrees relative to long-edge.
++            boolean rotateEven = rotatePref ^ shortEdge;
++
++            // Pass 1 = pages 1,3,5,... (0-based indexes 0,2,4,...)
++            // Pass 2 = pages 2,4,6,...; if the page count is odd the last back side is blank (-1).
++            List<Integer> odd = new ArrayList<>();
++            List<Integer> even = new ArrayList<>();
++            for (int i = 0; i < pageCount; i += 2) {
++                odd.add(i);
++                even.add(i + 1 < pageCount ? i + 1 : -1);
+             }
++            if (reverseEven) java.util.Collections.reverse(even);
++            int sheets = odd.size();
+ 
+-            if (cancelled) {
+-                PrintLog.i(TAG, "Job cancelled by user");
+-                mainHandler.post(printJob::cancel);
+-                getSystemService(NotificationManager.class).cancel(notifId);
+-                PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+-                        jobName, System.currentTimeMillis(), "CANCELLED",
+-                        "Cancelled by user", pageCount));
+-                return;
+-            }
++            // Register before printing so a fast tap can't be missed.
++            BlockingQueue<Boolean> answer = DuplexActionReceiver.register(notifId);
++            try {
++                notifBuilder.setContentText(jobName + " — printing front sides (" + sheets + " sheets)");
++                notifySafe(notifId, notifBuilder);
++
++                IppClient.IppResult r1 = renderAndSend(tempFile, odd, false, printerIp,
++                        jobName + " (front sides)");
++                if (r1 == null) { cancelJob(printJob, jobName, notifId, pageCount); return; }
++                if (!r1.success) {
++                    finishJob(printJob, jobName, notifId, notifBuilder, r1, pageCount, "");
++                    return;
++                }
+ 
+-            // Send via IPP
+-            IppClient.IppResult result = IppClient.sendPrintJob(printerIp, urfData, jobName);
++                // Ask the user to turn the stack over and wait for the answer.
++                postDuplexPrompt(notifId, jobName, sheets);
++                Boolean proceed = null;
++                long deadline = System.currentTimeMillis() + DUPLEX_WAIT_MS;
++                while (proceed == null && !cancelled && System.currentTimeMillis() < deadline) {
++                    proceed = answer.poll(1, TimeUnit.SECONDS);
++                }
++                if (proceed == null || !proceed || cancelled) {
++                    if (proceed == null && !cancelled) {
++                        PrintLog.w(TAG, "Timed out waiting for user to flip pages");
++                    }
++                    cancelJob(printJob, jobName, notifId, pageCount);
++                    return;
++                }
+ 
+-            if (result.success) {
+-                PrintLog.i(TAG, "Print job completed: " + jobName);
+-                mainHandler.post(printJob::complete);
+-
+-                // Update notification
+-                try {
+-                    notifBuilder.setContentTitle("Print complete")
+-                            .setContentText(jobName + " — " + pageCount + " page(s)")
+-                            .setOngoing(false)
+-                            .setAutoCancel(true)
+-                            .setProgress(0, 0, false);
+-                    getSystemService(NotificationManager.class).notify(notifId, notifBuilder.build());
+-                } catch (Exception ignored) {}
+-
+-                PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+-                        jobName, System.currentTimeMillis(), "COMPLETED",
+-                        urfData.length + " bytes, " + pageCount + " page(s)", pageCount));
+-            } else {
+-                PrintLog.e(TAG, "IPP failed: " + result.message);
+-                mainHandler.post(() -> printJob.fail(result.message));
+-                try {
+-                    NotificationCompat.Builder notif = new NotificationCompat.Builder(this, CHANNEL_ID)
+-                            .setSmallIcon(R.drawable.ic_printer)
+-                            .setContentTitle("Print failed")
+-                            .setContentText(result.message)
+-                            .setOngoing(false).setAutoCancel(true);
+-                    getSystemService(NotificationManager.class).notify(notifId, notif.build());
+-                } catch (Exception ignored) {}
+-                PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+-                        jobName, System.currentTimeMillis(), "FAILED",
+-                        result.message, pageCount));
++                notifBuilder.setContentTitle("Printing...")
++                        .setContentText(jobName + " — printing back sides")
++                        .setOngoing(true).setProgress(0, 0, true)
++                        .clearActions();
++                notifySafe(notifId, notifBuilder);
++
++                IppClient.IppResult r2 = renderAndSend(tempFile, even, rotateEven, printerIp,
++                        jobName + " (back sides)");
++                if (r2 == null) { cancelJob(printJob, jobName, notifId, pageCount); return; }
++                finishJob(printJob, jobName, notifId, notifBuilder, r2, pageCount,
++                        ", manual duplex");
++            } finally {
++                DuplexActionReceiver.unregister(notifId);
+             }
+ 
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            cancelJob(printJob, jobName, notifId, 0);
+         } catch (IOException e) {
+             PrintLog.e(TAG, "Print failed: " + e.getMessage(), e);
+             String reason = "Could not print to " + printerIp + " — " + e.getMessage();
+             mainHandler.post(() -> printJob.fail(reason));
++            getSystemService(NotificationManager.class).cancel(notifId);
+             PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+                     jobName, System.currentTimeMillis(), "FAILED", reason, 0));
+         } catch (OutOfMemoryError e) {
+             PrintLog.e(TAG, "Out of memory rendering PDF");
+             String reason = "Document too large to render at 600 DPI";
+             mainHandler.post(() -> printJob.fail(reason));
++            getSystemService(NotificationManager.class).cancel(notifId);
+             PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
+                     jobName, System.currentTimeMillis(), "FAILED", reason, 0));
+         } finally {
+             if (tempFile != null) tempFile.delete();
++            closeQuietly(pfd);
++        }
++    }
++
++    /**
++     * Render the given PDF pages (0-based; -1 = blank page) one at a time, encode them as
++     * URF and send them as one IPP job. Returns null if the user cancelled meanwhile.
++     */
++    private IppClient.IppResult renderAndSend(File pdf, List<Integer> pageIdx, boolean rotate180,
++                                              String printerIp, String label) throws IOException {
++        ParcelFileDescriptor tempPfd = ParcelFileDescriptor.open(pdf,
++                ParcelFileDescriptor.MODE_READ_ONLY);
++        PdfRenderer renderer = new PdfRenderer(tempPfd);
++        try {
++            ByteArrayOutputStream out = new ByteArrayOutputStream();
++            UrfEncoder.writeDocumentHeader(out, pageIdx.size());
++
++            for (int n = 0; n < pageIdx.size(); n++) {
++                if (cancelled) {
++                    PrintLog.i(TAG, "Job cancelled by user");
++                    return null;
++                }
++                int idx = pageIdx.get(n);
++                if (idx < 0) {
++                    PrintLog.i(TAG, "Adding blank page");
++                    UrfEncoder.encodeBlankPage(out);
++                    continue;
++                }
++
++                long renderStart = System.currentTimeMillis();
++                PdfRenderer.Page page = renderer.openPage(idx);
++                // Render at 600 DPI, matching printer's expected dimensions
++                Bitmap bmp = Bitmap.createBitmap(
++                        UrfEncoder.A4_WIDTH_600, UrfEncoder.A4_HEIGHT_600,
++                        Bitmap.Config.ARGB_8888);
++                // Fill white first (PDF may not fill background)
++                bmp.eraseColor(0xFFFFFFFF);
++                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT);
++                page.close();
++                PrintLog.i(TAG, "Page " + (idx + 1) + " rendered in "
++                        + (System.currentTimeMillis() - renderStart) + " ms");
++
++                UrfEncoder.encodePage(out, bmp, rotate180);
++                bmp.recycle();
++            }
++
++            byte[] urfData = out.toByteArray();
++            PrintLog.i(TAG, "URF encoded: " + urfData.length + " bytes (" + label + ")");
++            if (cancelled) return null;
++            return IppClient.sendPrintJob(printerIp, urfData, label);
++        } finally {
++            renderer.close();
++            tempPfd.close();
++        }
++    }
++
++    private void finishJob(PrintJob printJob, String jobName, int notifId,
++                           NotificationCompat.Builder notifBuilder, IppClient.IppResult result,
++                           int pageCount, String extra) {
++        if (result == null) {
++            cancelJob(printJob, jobName, notifId, pageCount);
++            return;
++        }
++        if (result.success) {
++            PrintLog.i(TAG, "Print job completed: " + jobName);
++            mainHandler.post(printJob::complete);
++            try {
++                notifBuilder.setContentTitle("Print complete")
++                        .setContentText(jobName + " — " + pageCount + " page(s)")
++                        .setOngoing(false)
++                        .setAutoCancel(true)
++                        .setProgress(0, 0, false)
++                        .clearActions();
++                getSystemService(NotificationManager.class).notify(notifId, notifBuilder.build());
++            } catch (Exception ignored) {}
++            PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
++                    jobName, System.currentTimeMillis(), "COMPLETED",
++                    pageCount + " page(s)" + extra, pageCount));
++        } else {
++            PrintLog.e(TAG, "IPP failed: " + result.message);
++            mainHandler.post(() -> printJob.fail(result.message));
++            try {
++                NotificationCompat.Builder notif = new NotificationCompat.Builder(this, CHANNEL_ID)
++                        .setSmallIcon(R.drawable.ic_printer)
++                        .setContentTitle("Print failed")
++                        .setContentText(result.message)
++                        .setOngoing(false).setAutoCancel(true);
++                getSystemService(NotificationManager.class).notify(notifId, notif.build());
++            } catch (Exception ignored) {}
++            PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
++                    jobName, System.currentTimeMillis(), "FAILED",
++                    result.message, pageCount));
+         }
+     }
+ 
++    private void cancelJob(PrintJob printJob, String jobName, int notifId, int pageCount) {
++        PrintLog.i(TAG, "Job cancelled: " + jobName);
++        mainHandler.post(() -> {
++            try { printJob.cancel(); } catch (Exception ignored) {}
++        });
++        getSystemService(NotificationManager.class).cancel(notifId);
++        PrintJobHistory.addJob(this, new PrintJobHistory.JobRecord(
++                jobName, System.currentTimeMillis(), "CANCELLED", "Cancelled", pageCount));
++    }
++
++    private void notifySafe(int notifId, NotificationCompat.Builder b) {
++        try {
++            getSystemService(NotificationManager.class).notify(notifId, b.build());
++        } catch (Exception ignored) {}
++    }
++
++    /** "Flip the stack" prompt with Continue / Cancel buttons. */
++    private void postDuplexPrompt(int notifId, String jobName, int sheets) {
++        Intent cont = new Intent(this, DuplexActionReceiver.class)
++                .setAction(DuplexActionReceiver.ACTION_CONTINUE)
++                .putExtra(DuplexActionReceiver.EXTRA_JOB_KEY, notifId);
++        Intent cancel = new Intent(this, DuplexActionReceiver.class)
++                .setAction(DuplexActionReceiver.ACTION_CANCEL)
++                .putExtra(DuplexActionReceiver.EXTRA_JOB_KEY, notifId);
++        int flags = PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT;
++        PendingIntent contPi = PendingIntent.getBroadcast(this, notifId, cont, flags);
++        PendingIntent cancelPi = PendingIntent.getBroadcast(this, notifId, cancel, flags);
++
++        String text = "Front sides done (" + sheets + " sheet" + (sheets == 1 ? "" : "s") + "). "
++                + "Take the stack from the output tray and put it back in the input tray "
++                + "with the printed side down, then tap Print back sides.";
++        NotificationCompat.Builder b = new NotificationCompat.Builder(this, DUPLEX_CHANNEL_ID)
++                .setSmallIcon(R.drawable.ic_printer)
++                .setContentTitle("Flip the pages — " + jobName)
++                .setContentText("Put the printed stack back in the tray, then tap Print back sides")
++                .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
++                .setPriority(NotificationCompat.PRIORITY_HIGH)
++                .setOngoing(true)
++                .addAction(0, "Print back sides", contPi)
++                .addAction(0, "Cancel", cancelPi);
++        notifySafe(notifId, b);
++    }
++
++    private static void closeQuietly(ParcelFileDescriptor pfd) {
++        try { if (pfd != null) pfd.close(); } catch (IOException ignored) {}
++    }
++
+     private void copyToFile(ParcelFileDescriptor pfd, File dest) throws IOException {
+         InputStream in = new FileInputStream(pfd.getFileDescriptor());
+         FileOutputStream out = new FileOutputStream(dest);
+@@ -328,7 +490,8 @@
+                             PrintAttributes.COLOR_MODE_MONOCHROME,
+                             PrintAttributes.COLOR_MODE_MONOCHROME)
+                     .setDuplexModes(
+-                            PrintAttributes.DUPLEX_MODE_NONE | PrintAttributes.DUPLEX_MODE_LONG_EDGE,
++                            PrintAttributes.DUPLEX_MODE_NONE | PrintAttributes.DUPLEX_MODE_LONG_EDGE
++                                    | PrintAttributes.DUPLEX_MODE_SHORT_EDGE,
+                             PrintAttributes.DUPLEX_MODE_NONE)
+                     .build();
+ 
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/values/strings.xml android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/values/strings.xml
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/values/strings.xml	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/values/strings.xml	2026-10-15 10:57:12.129058295 +0000
+@@ -9,6 +9,12 @@
+     <string name="pref_printer_ip">Printer IP Address</string>
+     <string name="pref_printer_ip_summary">Find this on your printer\'s config page</string>
+ 
++    <string name="pref_category_duplex">Two-sided printing (manual)</string>
++    <string name="pref_duplex_reverse">Print back sides in reverse order</string>
++    <string name="pref_duplex_reverse_summary">On: page order is right when you put the stack back as it came out. Turn off if the back sides end up in reverse order.</string>
++    <string name="pref_duplex_rotate">Rotate back sides 180°</string>
++    <string name="pref_duplex_rotate_summary">Turn on if the back sides come out upside-down compared to the fronts.</string>
++
+     <string name="pref_category_diagnostics">Test &amp; Diagnostics</string>
+     <string name="pref_test_network">Test Network Connection</string>
+     <string name="pref_test_network_summary">Check if the printer is reachable</string>
+@@ -26,7 +32,7 @@
+ 
+     <string name="pref_category_instructions">How to use</string>
+     <string name="pref_info_title">Setup Instructions</string>
+-    <string name="pref_info_summary">1. Set the printer IP above\n2. Go to Android Settings → Connected devices → Printing\n3. Enable \"Xerox 3025 Print Plugin\"\n4. Print any document and select \"Xerox WorkCentre 3025\"</string>
++    <string name="pref_info_summary">1. Set the printer IP above\n2. Go to Android Settings → Connected devices → Printing\n3. Enable \"Xerox 3025 Print Plugin\"\n4. Print any document and select \"Xerox WorkCentre 3025\"\n5. For two-sided: choose Two-sided in the print dialog, then flip the stack when the notification asks</string>
+ 
+     <string name="no_print_history">No print jobs yet</string>
+ 
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/xml/preferences.xml android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/xml/preferences.xml
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/xml/preferences.xml	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/app/src/main/res/xml/preferences.xml	2026-10-15 10:57:12.128788597 +0000
+@@ -20,6 +20,22 @@
+ 
+     </PreferenceCategory>
+ 
++    <PreferenceCategory app:title="@string/pref_category_duplex">
++
++        <SwitchPreferenceCompat
++            app:key="duplex_reverse_even"
++            app:title="@string/pref_duplex_reverse"
++            app:summary="@string/pref_duplex_reverse_summary"
++            app:defaultValue="true" />
++
++        <SwitchPreferenceCompat
++            app:key="duplex_rotate_even"
++            app:title="@string/pref_duplex_rotate"
++            app:summary="@string/pref_duplex_rotate_summary"
++            app:defaultValue="false" />
++
++    </PreferenceCategory>
++
+     <PreferenceCategory app:title="@string/pref_category_diagnostics">
+ 
+         <Preference
+diff -ruN /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/docs/CONTRIBUTING.md android-print-plugin-xerox-workcenter-3025-wifi-main/docs/CONTRIBUTING.md
+--- /tmp/orig/android-print-plugin-xerox-workcenter-3025-wifi-main/docs/CONTRIBUTING.md	2026-04-04 07:39:54.000000000 +0000
++++ android-print-plugin-xerox-workcenter-3025-wifi-main/docs/CONTRIBUTING.md	2026-10-15 10:57:12.129562079 +0000
+@@ -52,7 +52,7 @@
+ 
+ - Better UI (Material Design, proper settings layout)
+ - Automatic printer discovery (mDNS/Bonjour)
+-- Duplex printing support
++- Duplex printing support (manual duplex is implemented; hardware duplex is not available on the 3025)
+ - Scanning support (the 3025 has a scanner)
+ - Support for other Xerox/Samsung SPL printers
+ - Localization

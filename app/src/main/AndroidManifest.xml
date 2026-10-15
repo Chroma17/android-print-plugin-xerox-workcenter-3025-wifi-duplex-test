@@ -49,6 +49,11 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- Handles the "Print back sides" / "Cancel" buttons of the manual duplex notification -->
+        <receiver
+            android:name=".DuplexActionReceiver"
+            android:exported="false" />
+
         <!-- The PrintService itself -->
         <service
             android:name=".Xerox3025PrintService"

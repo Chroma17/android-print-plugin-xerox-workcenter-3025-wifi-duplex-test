@@ -9,6 +9,12 @@
     <string name="pref_printer_ip">Printer IP Address</string>
     <string name="pref_printer_ip_summary">Find this on your printer\'s config page</string>
 
+    <string name="pref_category_duplex">Two-sided printing (manual)</string>
+    <string name="pref_duplex_reverse">Print back sides in reverse order</string>
+    <string name="pref_duplex_reverse_summary">On: page order is right when you put the stack back as it came out. Turn off if the back sides end up in reverse order.</string>
+    <string name="pref_duplex_rotate">Rotate back sides 180°</string>
+    <string name="pref_duplex_rotate_summary">Turn on if the back sides come out upside-down compared to the fronts.</string>
+
     <string name="pref_category_diagnostics">Test &amp; Diagnostics</string>
     <string name="pref_test_network">Test Network Connection</string>
     <string name="pref_test_network_summary">Check if the printer is reachable</string>
@@ -26,7 +32,7 @@
 
     <string name="pref_category_instructions">How to use</string>
     <string name="pref_info_title">Setup Instructions</string>
-    <string name="pref_info_summary">1. Set the printer IP above\n2. Go to Android Settings → Connected devices → Printing\n3. Enable \"Xerox 3025 Print Plugin\"\n4. Print any document and select \"Xerox WorkCentre 3025\"</string>
+    <string name="pref_info_summary">1. Set the printer IP above\n2. Go to Android Settings → Connected devices → Printing\n3. Enable \"Xerox 3025 Print Plugin\"\n4. Print any document and select \"Xerox WorkCentre 3025\"\n5. For two-sided: choose Two-sided in the print dialog, then flip the stack when the notification asks</string>
 
     <string name="no_print_history">No print jobs yet</string>
 

@@ -48,33 +48,81 @@ public class IppClient {
             out.write(ippRequest);
             out.flush();
 
+            // Read the full HTTP response. A single read() often returns only the HTTP
+            // headers (the printer sends headers and body in separate segments), which
+            // used to be reported as "IPP status 0xffffffff" even though the job printed.
             InputStream in = socket.getInputStream();
-            byte[] resp = new byte[4096];
-            int read = in.read(resp);
+            ByteArrayOutputStream respBuf = new ByteArrayOutputStream();
+            byte[] chunk = new byte[4096];
+            int headerEnd = -1;
+            int contentLength = -1;
+            boolean chunked = false;
+            try {
+                while (true) {
+                    int n = in.read(chunk);
+                    if (n < 0) break;
+                    respBuf.write(chunk, 0, n);
+                    byte[] cur = respBuf.toByteArray();
+                    if (headerEnd < 0) {
+                        headerEnd = indexOf(cur, cur.length, "\r\n\r\n");
+                        if (headerEnd >= 0) {
+                            String headers = new String(cur, 0, headerEnd).toLowerCase();
+                            chunked = headers.contains("transfer-encoding: chunked");
+                            int cl = headers.indexOf("content-length:");
+                            if (cl >= 0) {
+                                int eol = headers.indexOf("\r\n", cl);
+                                String v = headers.substring(cl + 15, eol < 0 ? headers.length() : eol).trim();
+                                try { contentLength = Integer.parseInt(v); } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                    if (headerEnd >= 0) {
+                        int bodyLen = cur.length - (headerEnd + 4);
+                        if (contentLength >= 0 ? bodyLen >= contentLength : bodyLen >= 12) break;
+                    }
+                }
+            } catch (java.net.SocketTimeoutException e) {
+                PrintLog.w(TAG, "Timed out waiting for printer response");
+            }
             socket.close();
 
+            byte[] resp = respBuf.toByteArray();
+            int read = resp.length;
             if (read <= 0) {
                 PrintLog.e(TAG, "Empty response from printer");
                 return new IppResult(false, -1, "Empty response from printer");
             }
 
-            String response = new String(resp, 0, Math.min(read, 200));
-            boolean httpOk = response.contains("200");
+            String statusLine = new String(resp, 0, Math.min(read, 64)).split("\r\n", 2)[0];
+            String[] parts = statusLine.split(" ");
+            boolean httpOk = parts.length >= 2 && parts[1].equals("200");
 
-            // Parse IPP status from response body
+            // Parse IPP status from response body: version(2) status(2) request-id(4)
             int ippStatus = -1;
             int bodyStart = indexOf(resp, read, "\r\n\r\n");
-            if (bodyStart >= 0 && bodyStart + 6 < read) {
-                bodyStart += 4; // skip \r\n\r\n
-                ippStatus = ((resp[bodyStart + 2] & 0xFF) << 8) | (resp[bodyStart + 3] & 0xFF);
+            if (bodyStart >= 0) {
+                bodyStart += 4;
+                if (chunked) {
+                    int eol = indexOf(java.util.Arrays.copyOfRange(resp, bodyStart, read),
+                            read - bodyStart, "\r\n");
+                    bodyStart = (eol >= 0) ? bodyStart + eol + 2 : read;
+                }
+                if (bodyStart + 4 <= read) {
+                    ippStatus = ((resp[bodyStart + 2] & 0xFF) << 8) | (resp[bodyStart + 3] & 0xFF);
+                }
             }
 
             if (httpOk && ippStatus >= 0 && ippStatus < 0x0100) {
                 PrintLog.i(TAG, "IPP job accepted (status 0x"
                         + String.format("%04x", ippStatus) + ")");
                 return new IppResult(true, ippStatus, "Job accepted");
+            } else if (httpOk && ippStatus < 0) {
+                // The printer took the data (HTTP 200) but sent no readable IPP status.
+                // In practice the job still prints, so don't report a failure.
+                PrintLog.w(TAG, "HTTP 200 but no IPP status in response; assuming job accepted");
+                return new IppResult(true, -1, "Job sent (no status from printer)");
             } else {
-                String msg = "IPP error: HTTP " + (httpOk ? "200" : "error")
+                String msg = "IPP error: HTTP " + (httpOk ? "200" : statusLine)
                         + ", IPP status 0x" + String.format("%04x", ippStatus);
                 PrintLog.e(TAG, msg);
                 return new IppResult(false, ippStatus, msg);
